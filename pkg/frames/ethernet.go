@@ -63,3 +63,16 @@ func (e *EthernetFrame) String() string {
 	return fmt.Sprintf("[Eth] %x -> %x | Type: 0x%04x (%s) | Payload: %d bytes",
 		e.SrcMAC, e.DstMAC, e.EtherType, typeStr, len(e.Payload))
 }
+
+// bytes encodes the frame back to wire format
+func (e *EthernetFrame) Bytes() []byte {
+	// header (14) + payload (n)
+	buf := make([]byte, EthernetHeaderSize+len(e.Payload))
+
+	copy(buf[0:6], e.DstMAC[:])
+	copy(buf[6:12], e.SrcMAC[:])
+	binary.BigEndian.PutUint16(buf[12:14], e.EtherType)
+	copy(buf[14:], e.Payload)
+
+	return buf
+}
