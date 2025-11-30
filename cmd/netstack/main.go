@@ -18,28 +18,36 @@ const (
 	MTU     = 1500
 )
 
-// virtual identity
+// ANSI colors
+const (
+	ColorReset  = "\033[0m"
+	ColorRed    = "\033[31m"
+	ColorGreen  = "\033[32m"
+	ColorYellow = "\033[33m"
+	ColorBlue   = "\033[34m"
+	ColorPurple = "\033[35m"
+	ColorCyan   = "\033[36m"
+	ColorGray   = "\033[90m"
+)
+
 var (
 	MyIP  = net.IPv4(192, 168, 1, 10)
 	MyMAC = net.HardwareAddr{0x00, 0x00, 0x00, 0x00, 0x00, 0x01}
 )
 
 func main() {
-	// start TAP interface
-	fmt.Printf("Initializing interface %s...\n", DevName)
+	fmt.Printf(ColorCyan+"Initializing interface %s...\n"+ColorReset, DevName)
 	iface, err := device.NewTAP(DevName)
 	if err != nil {
 		log.Fatalf("Error creating TAP: %v", err)
 	}
 	defer iface.Close()
-	fmt.Printf("Interface %s ready.\n", DevName)
-	fmt.Printf("I am %s (MAC: %s)\nWaiting for packets...\n", MyIP, MyMAC)
+	fmt.Printf(ColorCyan+"Interface %s ready.\n"+ColorReset, DevName)
+	fmt.Printf(ColorCyan+"I am %s (MAC: %s)\nWaiting for packets...\n"+ColorReset, MyIP, MyMAC)
 
-	// setup graceful shutdown (Ctrl+C)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// read loop
 	go func() {
 		buf := make([]byte, MTU)
 		for {
@@ -49,23 +57,16 @@ func main() {
 				return
 			}
 
-			// parse L2 (ethernet)
 			frame, err := frames.ParseEthernet(buf[:n])
 			if err != nil {
-				// too noisy to log every bad frame
 				continue
 			}
 
-			// L3 switch
 			switch frame.EtherType {
 			case frames.EtherTypeARP:
 				handleARP(iface, frame)
-
 			case frames.EtherTypeIPv4:
 				handleIPv4(iface, frame)
-
-			case frames.EtherTypeIPv6:
-				// silence
 			}
 		}
 	}()
@@ -74,8 +75,6 @@ func main() {
 	fmt.Println("\nShutting down netstack...")
 }
 
-// handlers organized
-
 func handleARP(iface *device.Interface, frame *frames.EthernetFrame) {
 	arp, err := packets.ParseARP(frame.Payload)
 	if err != nil {
@@ -83,7 +82,7 @@ func handleARP(iface *device.Interface, frame *frames.EthernetFrame) {
 	}
 
 	if arp.Operation == packets.ARPRequest && arp.DstIP.Equal(MyIP) {
-		fmt.Printf("[ARP] Who is %s? It's me! Sending reply...\n", MyIP)
+		fmt.Printf(ColorYellow+"[ARP] Who is %s? It's me! Sending reply...\n"+ColorReset, MyIP)
 
 		replyPayload, _ := arp.ReplyAs(MyMAC, MyIP.To4())
 		ethReply := frames.EthernetFrame{
@@ -102,61 +101,127 @@ func handleIPv4(iface *device.Interface, frame *frames.EthernetFrame) {
 		return
 	}
 
-	// filter: only packets for me
 	if !ipPacket.DstIP.Equal(MyIP) {
 		return
 	}
 
-	fmt.Println(ipPacket.String())
+	switch ipPacket.Protocol {
+	case packets.ProtocolICMP:
+		handleICMP(iface, frame, ipPacket)
+	case packets.ProtocolUDP:
+		handleUDP(iface, frame, ipPacket)
+	case packets.ProtocolTCP:
+		handleTCP(iface, frame, ipPacket)
+	}
+}
 
-	// L4 switch (ICMP is actually L3.5 but sits inside IP payload)
-	if ipPacket.Protocol == packets.ProtocolICMP {
-		icmpPacket, err := packets.ParseICMP(frame.Payload[20:]) // skip 20 bytes IP header
-		if err != nil {
-			log.Printf("ICMP Parse error: %v", err)
-			return
+func handleICMP(iface *device.Interface, frame *frames.EthernetFrame, ipPacket *packets.IPv4Header) {
+	icmpPacket, err := packets.ParseICMP(frame.Payload[20:])
+	if err != nil {
+		return
+	}
+	if icmpPacket.Type == packets.ICMPEchoRequest {
+		fmt.Printf(ColorPurple+"[ICMP] Ping Request (ID=%d Seq=%d). Sending Pong!\n"+ColorReset, icmpPacket.ID, icmpPacket.Seq)
+		pong := packets.ICMPMessage{
+			Type: packets.ICMPEchoReply, Code: 0, ID: icmpPacket.ID, Seq: icmpPacket.Seq, Data: icmpPacket.Data,
+		}
+		sendIPv4(iface, frame.SrcMAC, ipPacket.SrcIP, packets.ProtocolICMP, pong.Bytes())
+	}
+}
+
+func handleUDP(iface *device.Interface, frame *frames.EthernetFrame, ipPacket *packets.IPv4Header) {
+	udpPacket, err := packets.ParseUDP(frame.Payload[20:])
+	if err != nil {
+		return
+	}
+
+	fmt.Printf(ColorBlue+"[UDP] %d -> %d: %q\n"+ColorReset, udpPacket.SrcPort, udpPacket.DstPort, string(udpPacket.Data))
+
+	replyUDP := packets.UDPPacket{
+		SrcPort: udpPacket.DstPort, DstPort: udpPacket.SrcPort, Data: udpPacket.Data,
+	}
+	sendIPv4(iface, frame.SrcMAC, ipPacket.SrcIP, packets.ProtocolUDP, replyUDP.Bytes(MyIP, ipPacket.SrcIP))
+}
+
+func handleTCP(iface *device.Interface, frame *frames.EthernetFrame, ipPacket *packets.IPv4Header) {
+	tcpPacket, err := packets.ParseTCP(frame.Payload[20:])
+	if err != nil {
+		log.Printf("TCP Error: %v", err)
+		return
+	}
+
+	// logs raw TCP details in gray to reduce noise
+	fmt.Printf(ColorGray+"%s\n"+ColorReset, tcpPacket.String())
+
+	// handle closed ports (send RST to stop retries)
+	if tcpPacket.DstPort != 80 {
+		fmt.Printf(ColorRed+"   -> Port %d closed. Sending RST.\n"+ColorReset, tcpPacket.DstPort)
+		rst := packets.TCPHeader{
+			SrcPort:    tcpPacket.DstPort,
+			DstPort:    tcpPacket.SrcPort,
+			SeqNum:     0,
+			AckNum:     tcpPacket.SeqNum + 1,
+			DataOffset: 5,
+			Flags:      packets.TCPFlagRST | packets.TCPFlagACK,
+			Window:     0,
+		}
+		sendIPv4(iface, frame.SrcMAC, ipPacket.SrcIP, packets.ProtocolTCP, rst.Bytes(MyIP, ipPacket.SrcIP))
+		return
+	}
+
+	// handshake step 1: client sends SYN
+	if (tcpPacket.Flags & packets.TCPFlagSYN) != 0 {
+		fmt.Printf(ColorGreen + "   -> Connection Request (SYN). Sending SYN-ACK...\n" + ColorReset)
+
+		synAck := packets.TCPHeader{
+			SrcPort:    tcpPacket.DstPort,
+			DstPort:    tcpPacket.SrcPort,
+			SeqNum:     1000,
+			AckNum:     tcpPacket.SeqNum + 1,
+			DataOffset: 5,
+			Flags:      packets.TCPFlagSYN | packets.TCPFlagACK,
+			Window:     65535,
+			UrgentPtr:  0,
 		}
 
-		if icmpPacket.Type == packets.ICMPEchoRequest {
-			fmt.Printf("   -> Ping Request (ID=%d Seq=%d). Sending Pong!\n", icmpPacket.ID, icmpPacket.Seq)
+		sendIPv4(iface, frame.SrcMAC, ipPacket.SrcIP, packets.ProtocolTCP, synAck.Bytes(MyIP, ipPacket.SrcIP))
+		return
+	}
 
-			// create ICMP reply
-			pong := packets.ICMPMessage{
-				Type: packets.ICMPEchoReply, // change type to 0
-				Code: 0,
-				ID:   icmpPacket.ID,   // copy ID
-				Seq:  icmpPacket.Seq,  // copy seq
-				Data: icmpPacket.Data, // echo back the data payload
-			}
-			pongBytes := pong.Bytes()
+	// handle FIN (client wants to close)
+	if (tcpPacket.Flags & packets.TCPFlagFIN) != 0 {
+		fmt.Printf(ColorYellow + "   -> Client sent FIN. Sending FIN-ACK.\n" + ColorReset)
 
-			// create IPv4 header
-			// src = me, dst = sender
-			replyIP := packets.IPv4Header{
-				Version:        4,
-				IHL:            5, // 20 bytes
-				TOS:            0,
-				TotalLength:    uint16(20 + len(pongBytes)),
-				Identification: 0, // not fragmenting, so 0 is fine
-				Flags:          0,
-				FragmentOffset: 0,
-				TTL:            64,
-				Protocol:       packets.ProtocolICMP,
-				SrcIP:          MyIP,
-				DstIP:          ipPacket.SrcIP,
-			}
-			ipBytes := replyIP.Bytes()
+		// respond with FIN-ACK to ack closure
+		// SeqNum 1001 (assuming we sent SYN-ACK at 1000 previously)
+		finAck := packets.TCPHeader{
+			SrcPort:    tcpPacket.DstPort,
+			DstPort:    tcpPacket.SrcPort,
+			SeqNum:     1001,
+			AckNum:     tcpPacket.SeqNum + 1,
+			DataOffset: 5,
+			Flags:      packets.TCPFlagFIN | packets.TCPFlagACK,
+			Window:     65535,
+			UrgentPtr:  0,
+		}
+		sendIPv4(iface, frame.SrcMAC, ipPacket.SrcIP, packets.ProtocolTCP, finAck.Bytes(MyIP, ipPacket.SrcIP))
+		return
+	}
 
-			// encapsulate in Ethernet
-			ethReply := frames.EthernetFrame{
-				DstMAC:    frame.SrcMAC,
-				SrcMAC:    [6]byte(MyMAC),
-				EtherType: frames.EtherTypeIPv4,
-				Payload:   append(ipBytes, pongBytes...), // IP header + ICMP payload
-			}
-
-			// send
-			iface.Write(ethReply.Bytes())
+	// handshake step 3: client sends ACK
+	if (tcpPacket.Flags & packets.TCPFlagACK) != 0 {
+		if tcpPacket.AckNum == 1001 {
+			fmt.Printf(ColorGreen + "   -> Connection ESTABLISHED! (Client Acked our SYN)\n" + ColorReset)
 		}
 	}
+}
+
+func sendIPv4(iface *device.Interface, dstMAC [6]byte, dstIP net.IP, protocol uint8, data []byte) {
+	ipHeader := packets.IPv4Header{
+		Version: 4, IHL: 5, TotalLength: uint16(20 + len(data)), TTL: 64, Protocol: protocol, SrcIP: MyIP, DstIP: dstIP,
+	}
+	ethFrame := frames.EthernetFrame{
+		DstMAC: dstMAC, SrcMAC: [6]byte(MyMAC), EtherType: frames.EtherTypeIPv4, Payload: append(ipHeader.Bytes(), data...),
+	}
+	iface.Write(ethFrame.Bytes())
 }
